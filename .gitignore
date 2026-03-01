@@ -1,0 +1,4 @@
+sshpad
+*.deb
+build/
+pkg/

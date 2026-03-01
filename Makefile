@@ -23,9 +23,10 @@ clean:
 	rm -f $(TARGET)
 
 install: $(TARGET)
-	install -Dm755 $(TARGET) $(DESTDIR)/usr/local/bin/$(TARGET)
-	install -Dm644 ui/index.html $(DESTDIR)/usr/local/share/sshpad/ui/index.html
-	install -Dm644 ui/style.css  $(DESTDIR)/usr/local/share/sshpad/ui/style.css
-	install -Dm644 ui/app.js     $(DESTDIR)/usr/local/share/sshpad/ui/app.js
+	install -Dm755 $(TARGET) $(DESTDIR)/usr/bin/$(TARGET)
+	install -Dm644 ui/index.html    $(DESTDIR)/usr/share/sshpad/ui/index.html
+	install -Dm644 ui/style.css     $(DESTDIR)/usr/share/sshpad/ui/style.css
+	install -Dm644 ui/app.js        $(DESTDIR)/usr/share/sshpad/ui/app.js
+	install -Dm644 ui/terminal.svg  $(DESTDIR)/usr/share/sshpad/ui/terminal.svg
 
 .PHONY: clean install

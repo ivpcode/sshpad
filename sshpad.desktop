@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=SSHPad
+Comment=SSH connection manager
+Exec=sshpad
+Icon=sshpad
+Terminal=false
+Type=Application
+Categories=Network;RemoteAccess;GTK;
+Keywords=ssh;tunnel;connection;
