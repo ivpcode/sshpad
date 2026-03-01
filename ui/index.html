@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SSHPad</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1><img src="/terminal.svg" class="title-icon" alt="" /> SSHPad</h1>
+    <span id="status-indicator" class="status-dot inactive"></span>
+  </header>
+
+  <main id="connections"></main>
+
+  <dialog id="password-dialog">
+    <h3>&#x1F511; Autenticazione SSH</h3>
+    <p id="password-prompt"></p>
+    <form method="dialog" id="password-form">
+      <input type="password" id="password-input" placeholder="Password" autofocus />
+      <div class="dialog-actions">
+        <button type="button" id="password-cancel">Annulla</button>
+        <button type="submit" class="primary">Invia</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/app.js"></script>
+</body>
+</html>
