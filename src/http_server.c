@@ -6,6 +6,11 @@
 #include <json-c/json.h>
 #include <arpa/inet.h>
 
+#ifdef __APPLE__
+#include <mach-o/dyld.h>   /* _NSGetExecutablePath */
+#include <libgen.h>         /* dirname */
+#endif
+
 #include "http_server.h"
 #include "app_context.h"
 #include "sse.h"
@@ -60,11 +65,35 @@ static const char *get_content_type(const char *path)
 static const char *find_ui_dir(void)
 {
     static char exe_ui_path[512];
+    static char bundle_ui_path[512];
     static int  resolved = 0;
 
     if (!resolved) {
         resolved = 1;
-        char exe[508];  /* 508 + len("/ui") + NUL fits in exe_ui_path[512] */
+
+#ifdef __APPLE__
+        /* macOS: _NSGetExecutablePath() */
+        char exe[508];
+        uint32_t sz = sizeof(exe);
+        if (_NSGetExecutablePath(exe, &sz) == 0) {
+            /* Resolve symlinks */
+            char *real = realpath(exe, NULL);
+            if (real) {
+                char *dir = dirname(real);
+                snprintf(exe_ui_path, sizeof(exe_ui_path), "%s/ui", dir);
+                /* .app bundle: Contents/MacOS/sshpad → Contents/Resources/ui */
+                char *contents = strstr(dir, "/Contents/MacOS");
+                if (contents) {
+                    *contents = '\0';
+                    snprintf(bundle_ui_path, sizeof(bundle_ui_path),
+                             "%s/Contents/Resources/ui", dir);
+                }
+                free(real);
+            }
+        }
+#else
+        /* Linux: /proc/self/exe */
+        char exe[508];
         ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
         if (n > 0) {
             exe[n] = '\0';
@@ -74,13 +103,19 @@ static const char *find_ui_dir(void)
                 snprintf(exe_ui_path, sizeof(exe_ui_path), "%s/ui", exe);
             }
         }
+#endif
     }
 
     const char *candidates[] = {
         "./ui",
-        exe_ui_path[0] ? exe_ui_path : "",
+        exe_ui_path[0]    ? exe_ui_path    : "",
+        bundle_ui_path[0] ? bundle_ui_path : "",
+#ifdef __APPLE__
+        "/usr/local/share/sshpad/ui",
+#else
         "/usr/local/share/sshpad/ui",
         "/usr/share/sshpad/ui",
+#endif
     };
 
     for (int i = 0; i < (int)(sizeof(candidates) / sizeof(candidates[0])); i++) {

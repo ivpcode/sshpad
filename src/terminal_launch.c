@@ -37,6 +37,40 @@ pid_t launch_terminal_with_ssh(const char *host_alias)
         const char *fmt;
     } term_t;
 
+#ifdef __APPLE__
+    /* macOS: app native (.app) rilevate con `open -Ra`, CLI con `which`.
+     * Terminal.app e iTerm2 usano AppleScript; Alacritty e Kitty usano CLI. */
+    typedef struct {
+        const char *check;
+        int         use_open;  /* 1 = `open -Ra`, 0 = `which` */
+    } term_check_t;
+
+    static const struct {
+        term_check_t    detect;
+        const char     *fmt;
+    } mac_terminals[] = {
+        { { "Terminal",   1 }, "osascript -e 'tell app \"Terminal\" to do script \"%s\"'" },
+        { { "iTerm",      1 }, "osascript -e 'tell app \"iTerm\" to create window with default profile command \"%s\"'" },
+        { { "alacritty",  0 }, "alacritty -e sh -c '%s; exec $SHELL'"   },
+        { { "kitty",      0 }, "kitty sh -c '%s; exec $SHELL'"          },
+    };
+
+    for (int i = 0; i < (int)(sizeof(mac_terminals) / sizeof(mac_terminals[0])); i++) {
+        char detect_cmd[256];
+        if (mac_terminals[i].detect.use_open)
+            snprintf(detect_cmd, sizeof(detect_cmd),
+                     "open -Ra \"%s\" 2>/dev/null", mac_terminals[i].detect.check);
+        else
+            snprintf(detect_cmd, sizeof(detect_cmd),
+                     "which %s >/dev/null 2>&1", mac_terminals[i].detect.check);
+
+        if (system(detect_cmd) != 0)
+            continue;
+
+        const term_t dummy = { mac_terminals[i].detect.check,
+                               mac_terminals[i].fmt };
+        const term_t *t = &dummy;
+#else
     static const term_t terminals[] = {
         { "gnome-terminal",      "gnome-terminal -- sh -c '%s; exec bash'"          },
         { "konsole",             "konsole -e sh -c '%s; exec bash'"                 },
@@ -58,6 +92,7 @@ pid_t launch_terminal_with_ssh(const char *host_alias)
 
         if (system(which_cmd) != 0)
             continue;
+#endif
 
         /* Il terminale è disponibile: lancia il figlio. */
         pid_t pid = fork();
