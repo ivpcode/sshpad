@@ -31,8 +31,8 @@ install -m 644 "$PROJECT_DIR/ui/style.css"     "$PKG_DIR/usr/share/sshpad/ui/sty
 install -m 644 "$PROJECT_DIR/ui/app.js"        "$PKG_DIR/usr/share/sshpad/ui/app.js"
 install -m 644 "$PROJECT_DIR/ui/terminal.svg"  "$PKG_DIR/usr/share/sshpad/ui/terminal.svg"
 
-# Desktop entry
-install -m 644 "$PROJECT_DIR/sshpad.desktop" "$PKG_DIR/usr/share/applications/sshpad.desktop"
+# Desktop entry (nome deve corrispondere all'app ID GTK)
+install -m 644 "$PROJECT_DIR/io.github.sshpad.desktop" "$PKG_DIR/usr/share/applications/io.github.sshpad.desktop"
 
 # Icon (reuse terminal.svg)
 install -m 644 "$PROJECT_DIR/ui/terminal.svg" "$PKG_DIR/usr/share/icons/hicolor/scalable/apps/sshpad.svg"

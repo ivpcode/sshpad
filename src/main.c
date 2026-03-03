@@ -15,6 +15,7 @@ static void on_activate(GtkApplication *gtkapp, gpointer user_data) {
 
     GtkWidget *window = gtk_application_window_new(gtkapp);
     gtk_window_set_title(GTK_WINDOW(window), "SSHPad");
+    gtk_window_set_icon_name(GTK_WINDOW(window), "sshpad");
     window_state_load(GTK_WINDOW(window));
     window_state_connect(GTK_WINDOW(window));
 
@@ -40,6 +41,12 @@ static void cleanup(app_context_t *ctx) {
 }
 
 int main(int argc, char *argv[]) {
+    /* WebKitGTK 6.0 usa bubblewrap per il sandboxing, che richiede
+       unprivileged user namespaces nel kernel. Su molti sistemi questi
+       sono disabilitati (es. Ubuntu 24.04+). Dato che carichiamo solo
+       contenuti da 127.0.0.1, il sandbox non serve. */
+    setenv("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1", 0);
+
     app_context_t ctx = {0};
 
     ctx.port = find_free_port("127.0.0.1");
