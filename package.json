@@ -1,0 +1,21 @@
+{
+  "name": "sshpad",
+  "version": "1.0.0",
+  "private": true,
+  "description": "SSH connection manager with GTK4/WebKitGTK UI",
+  "scripts": {
+    "build": "npm run ui:build && npm run c:build",
+    "rebuild": "npm run ui:build && npm run c:rebuild",
+    "clean": "rm -rf build sshpad && cd ui && rm -rf dist",
+
+    "c:configure": "cmake -S . -B build",
+    "c:build": "cmake -S . -B build && cmake --build build -j$(nproc)",
+    "c:rebuild": "rm -rf build && cmake -S . -B build && cmake --build build -j$(nproc)",
+
+    "ui:install": "cd ui && npm install",
+    "ui:build": "cd ui && npm run build",
+    "ui:dev": "cd ui && npm run dev",
+
+    "start": "./sshpad"
+  }
+}

@@ -49,9 +49,11 @@ static void expand_tilde(char *dest, const char *src, size_t maxlen)
 /*
  * Parse a LocalForward / RemoteForward value.
  *
- * Accepted forms:
- *   <port>:<remote_host>:<remote_port>               (bind on localhost)
- *   <bind_addr>:<port>:<remote_host>:<remote_port>
+ * Accepted forms (OpenSSH syntax):
+ *   <port> <remote_host>:<remote_port>                 (space-separated, bind on localhost)
+ *   <bind_addr>:<port> <remote_host>:<remote_port>     (space-separated, explicit bind)
+ *   <port>:<remote_host>:<remote_port>                  (colon-only, bind on localhost)
+ *   <bind_addr>:<port>:<remote_host>:<remote_port>      (colon-only, explicit bind)
  *
  * Returns 0 on success, -1 on parse error.
  */
@@ -61,12 +63,46 @@ static int parse_forward(const char *val, forward_rule_t *rule)
     strncpy(buf, val, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
 
+    memset(rule, 0, sizeof(*rule));
+
+    /* Check for space-separated format first (most common in SSH configs):
+     *   <bind_spec> <remote_host>:<remote_port>
+     * where bind_spec is either "<port>" or "<bind_addr>:<port>" */
+    char *space = strchr(buf, ' ');
+    if (!space) space = strchr(buf, '\t');
+
+    if (space) {
+        *space = '\0';
+        char *bind_part  = buf;
+        char *remote_part = space + 1;
+        while (*remote_part == ' ' || *remote_part == '\t') remote_part++;
+
+        /* Parse bind part: either "port" or "addr:port" */
+        char *bind_colon = strchr(bind_part, ':');
+        if (bind_colon) {
+            *bind_colon = '\0';
+            snprintf(rule->bind_addr, sizeof(rule->bind_addr), "%s", bind_part);
+            rule->bind_port = atoi(bind_colon + 1);
+        } else {
+            strncpy(rule->bind_addr, "localhost", sizeof(rule->bind_addr) - 1);
+            rule->bind_port = atoi(bind_part);
+        }
+
+        /* Parse remote part: "host:port" */
+        char *remote_colon = strrchr(remote_part, ':');
+        if (!remote_colon) return -1;
+        *remote_colon = '\0';
+        snprintf(rule->remote_host, sizeof(rule->remote_host), "%s", remote_part);
+        rule->remote_port = atoi(remote_colon + 1);
+
+        return (rule->bind_port > 0 && rule->remote_port > 0) ? 0 : -1;
+    }
+
+    /* Colon-only format */
     int colons = 0;
     for (const char *p = buf; *p; p++) {
         if (*p == ':') colons++;
     }
-
-    memset(rule, 0, sizeof(*rule));
 
     if (colons == 2) {
         /* port:remote_host:remote_port */
@@ -105,6 +141,10 @@ static int parse_forward(const char *val, forward_rule_t *rule)
 static int parse_dynamic(const char *val, dynamic_rule_t *rule)
 {
     memset(rule, 0, sizeof(*rule));
+
+    /* Trim leading whitespace */
+    while (*val == ' ' || *val == '\t') val++;
+
     const char *colon = strchr(val, ':');
     if (colon) {
         size_t alen = (size_t)(colon - val);

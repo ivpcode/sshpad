@@ -5,6 +5,7 @@
 #include "sse.h"
 #include "process_manager.h"
 #include "config_parser.h"
+#include "local_proxy.h"
 
 typedef struct app_context {
     int                port;
@@ -13,6 +14,8 @@ typedef struct app_context {
     process_manager_t *pm;
     ssh_host_t        *hosts;
     int                num_hosts;
+    char               askpass_path[512];
+    local_proxy_t     *proxy;
 } app_context_t;
 
 #endif /* APP_CONTEXT_H */

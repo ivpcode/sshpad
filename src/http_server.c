@@ -55,6 +55,9 @@ static const char *get_content_type(const char *path)
     if (strstr(path, ".js"))   return "application/javascript; charset=utf-8";
     if (strstr(path, ".svg"))  return "image/svg+xml";
     if (strstr(path, ".png"))  return "image/png";
+    if (strstr(path, ".woff2")) return "font/woff2";
+    if (strstr(path, ".woff")) return "font/woff";
+    if (strstr(path, ".json")) return "application/json";
     return "application/octet-stream";
 }
 
@@ -106,7 +109,9 @@ static const char *find_ui_dir(void)
 #endif
     }
 
+    /* Preferisce ui/dist/ (output Vite build) se esiste, altrimenti ui/ */
     const char *candidates[] = {
+        "./ui/dist",
         "./ui",
         exe_ui_path[0]    ? exe_ui_path    : "",
         bundle_ui_path[0] ? bundle_ui_path : "",
@@ -182,6 +187,8 @@ serve_static(struct MHD_Connection *conn, const char *url)
         (size_t)fsize, content, MHD_RESPMEM_MUST_FREE);
     MHD_add_response_header(resp, "Content-Type", get_content_type(filepath));
     MHD_add_response_header(resp, "Access-Control-Allow-Origin", "*");
+    MHD_add_response_header(resp, "Cache-Control", "no-cache, no-store, must-revalidate");
+    MHD_add_response_header(resp, "Pragma", "no-cache");
     enum MHD_Result ret = MHD_queue_response(conn, MHD_HTTP_OK, resp);
     MHD_destroy_response(resp);
     return ret;
@@ -294,6 +301,79 @@ handle_get_status(struct MHD_Connection *conn, app_context_t *ctx)
              "{\"status\":\"ok\",\"numHosts\":%d,\"port\":%d}",
              ctx->num_hosts, ctx->port);
     return json_response(conn, MHD_HTTP_OK, buf);
+}
+
+/* ------------------------------------------------------------------ */
+/* GET /api/internal/askpass — Richiesta password dallo script askpass  */
+/*                                                                      */
+/* Lo script sshpad-askpass (invocato da SSH via SSH_ASKPASS) chiama    */
+/* questo endpoint con ?id=UUID&prompt=... . Il server:                 */
+/*   1. Invia un evento SSE "password_request" alla UI                  */
+/*   2. Blocca in attesa che l'utente inserisca la password nella UI    */
+/*   3. Risponde con la password in plain text (letta dallo script)     */
+/* ------------------------------------------------------------------ */
+
+static enum MHD_Result
+handle_internal_askpass(struct MHD_Connection *conn, app_context_t *ctx)
+{
+    const char *id     = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "id");
+    const char *prompt = MHD_lookup_connection_value(conn, MHD_GET_ARGUMENT_KIND, "prompt");
+
+    if (!id || id[0] == '\0')
+        return json_response(conn, MHD_HTTP_BAD_REQUEST,
+                             "{\"error\":\"missing id parameter\"}");
+
+    /* Cerca il nome alias dell'host a partire dal prompt SSH.
+     * Il prompt ha la forma "user@hostname's password:" oppure
+     * "Password for user@hostname:" — estraiamo hostname e cerchiamo
+     * tra gli host del config quale ha quel HostName. */
+    const char *host_alias = "";
+    if (prompt) {
+        for (int i = 0; i < ctx->num_hosts; i++) {
+            const ssh_host_t *h = &ctx->hosts[i];
+            /* Cerca hostname o nome alias nel prompt */
+            if ((h->hostname[0] && strstr(prompt, h->hostname)) ||
+                strstr(prompt, h->name)) {
+                host_alias = h->name;
+                break;
+            }
+        }
+    }
+
+    /* Broadcast SSE: chiedi la password nella UI */
+    {
+        json_object *jobj = json_object_new_object();
+        json_object_object_add(jobj, "requestId",
+                               json_object_new_string(id));
+        json_object_object_add(jobj, "host",
+                               json_object_new_string(host_alias));
+        json_object_object_add(jobj, "prompt",
+                               json_object_new_string(prompt ? prompt : "Password:"));
+        sse_broadcast(ctx->sse, "password_request",
+                      json_object_to_json_string(jobj));
+        json_object_put(jobj);
+    }
+
+    /* Blocca finché la UI non consegna la password (timeout ~120s) */
+    char *password = askpass_wait_for_password(id);
+
+    if (!password) {
+        /* Timeout o errore: rispondi stringa vuota (SSH fallirà) */
+        struct MHD_Response *resp = MHD_create_response_from_buffer(
+            0, "", MHD_RESPMEM_PERSISTENT);
+        MHD_add_response_header(resp, "Content-Type", "text/plain");
+        enum MHD_Result ret = MHD_queue_response(conn, MHD_HTTP_OK, resp);
+        MHD_destroy_response(resp);
+        return ret;
+    }
+
+    /* Rispondi con la password (lo script la stampa su stdout per SSH) */
+    struct MHD_Response *resp = MHD_create_response_from_buffer(
+        strlen(password), password, MHD_RESPMEM_MUST_FREE);
+    MHD_add_response_header(resp, "Content-Type", "text/plain");
+    enum MHD_Result ret = MHD_queue_response(conn, MHD_HTTP_OK, resp);
+    MHD_destroy_response(resp);
+    return ret;
 }
 
 /* ------------------------------------------------------------------ */
@@ -541,6 +621,8 @@ request_handler(void *cls,
             return handle_sse(conn, ctx);
         if (strcmp(url, "/api/status") == 0)
             return handle_get_status(conn, ctx);
+        if (strcmp(url, "/api/internal/askpass") == 0)
+            return handle_internal_askpass(conn, ctx);
         /* Tutto il resto: file statici */
         return serve_static(conn, url);
     }

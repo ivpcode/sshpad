@@ -24,6 +24,7 @@ typedef struct {
     char              host[128];
     pid_t             pid;
     int               active;
+    int               stderr_fd;   /* pipe per leggere stderr di SSH */
     process_manager_t *pm; /* puntatore al manager (per il thread monitor) */
 } tunnel_entry_t;
 
@@ -32,6 +33,7 @@ struct process_manager {
     pthread_mutex_t    mutex;
     tunnel_entry_t     tunnels[MAX_TUNNELS];
     int                num_tunnels;
+    char               askpass_path[512];
 };
 
 /* Wrapper passato al thread monitor per portare sia pm che entry */
@@ -61,15 +63,48 @@ static int is_valid_host_alias(const char *name)
  * Thread monitor: aspetta la terminazione del processo SSH e notifica via
  * SSE l'evento "tunnel_status" con status "inactive".
  * ---------------------------------------------------------------------- */
-static void broadcast_status(process_manager_t *pm, const char *host,
-                              const char *status_str, int exit_code)
+static void broadcast_status_msg(process_manager_t *pm, const char *host,
+                                  const char *status_str, int exit_code,
+                                  const char *message)
 {
     struct json_object *jobj = json_object_new_object();
     json_object_object_add(jobj, "host",     json_object_new_string(host));
     json_object_object_add(jobj, "status",   json_object_new_string(status_str));
     json_object_object_add(jobj, "exitCode", json_object_new_int(exit_code));
+    if (message)
+        json_object_object_add(jobj, "message", json_object_new_string(message));
     sse_broadcast(pm->sse, "tunnel_status", json_object_to_json_string(jobj));
     json_object_put(jobj);
+}
+
+/*
+ * read_stderr: legge tutto il contenuto disponibile dalla pipe stderr di SSH.
+ * Ritorna una stringa allocata con malloc (o NULL). Il chiamante deve fare free().
+ */
+static char *read_stderr(int fd)
+{
+    if (fd < 0) return NULL;
+
+    char buf[2048];
+    ssize_t total = 0;
+    ssize_t n;
+
+    /* Leggi tutto ciò che è disponibile (la pipe è stata chiusa dal figlio) */
+    while ((n = read(fd, buf + total,
+                     sizeof(buf) - 1 - (size_t)total)) > 0) {
+        total += n;
+        if (total >= (ssize_t)(sizeof(buf) - 1)) break;
+    }
+
+    if (total <= 0) return NULL;
+
+    buf[total] = '\0';
+
+    /* Rimuovi trailing newlines */
+    while (total > 0 && (buf[total - 1] == '\n' || buf[total - 1] == '\r'))
+        buf[--total] = '\0';
+
+    return strdup(buf);
 }
 
 static void *tunnel_monitor_thread(void *arg)
@@ -79,43 +114,82 @@ static void *tunnel_monitor_thread(void *arg)
     tunnel_entry_t    *entry = marg->entry;
     free(marg);
 
-    /* Dopo 2 secondi, se il processo è ancora vivo → "active" */
-    usleep(2000000);
-    int probe = waitpid(entry->pid, NULL, WNOHANG);
-    if (probe == 0) {
-        /* Ancora in vita */
-        broadcast_status(pm, entry->host, "active", 0);
+    /*
+     * Polling: controlla ogni 500ms se SSH è ancora vivo.
+     * ConnectTimeout è 10s, quindi aspettiamo fino a 12s prima di
+     * dichiarare "active". Se SSH muore prima → errore.
+     */
+    #define PROBE_INTERVAL_US  500000   /* 500 ms */
+    #define PROBE_MAX_CHECKS   24       /* 24 × 500ms = 12 secondi */
+
+    int declared_active = 0;
+    int wstatus = 0;
+    pid_t ret_pid = 0;
+
+    for (int check = 0; check < PROBE_MAX_CHECKS; check++) {
+        usleep(PROBE_INTERVAL_US);
+
+        ret_pid = waitpid(entry->pid, &wstatus, WNOHANG);
+        if (ret_pid != 0) {
+            /* Il processo è terminato durante la fase di connessione */
+            goto process_exited;
+        }
     }
 
-    int   status   = 0;
-    pid_t ret_pid  = waitpid(entry->pid, &status, 0);
+    /* SSH è sopravvissuto 12 secondi → la connessione è riuscita */
+    declared_active = 1;
+    broadcast_status_msg(pm, entry->host, "active", 0, NULL);
 
+    /* Ora attendi la terminazione (bloccante) */
+    ret_pid = waitpid(entry->pid, &wstatus, 0);
+
+process_exited:
+    ;
     int exit_code = -1;
     if (ret_pid > 0) {
-        if (WIFEXITED(status))
-            exit_code = WEXITSTATUS(status);
-        else if (WIFSIGNALED(status))
-            exit_code = -(int)WTERMSIG(status); /* negativo = segnale */
+        if (WIFEXITED(wstatus))
+            exit_code = WEXITSTATUS(wstatus);
+        else if (WIFSIGNALED(wstatus))
+            exit_code = -(int)WTERMSIG(wstatus);
+    }
+
+    /* Leggi l'eventuale messaggio di errore da stderr */
+    char *errmsg = read_stderr(entry->stderr_fd);
+    if (entry->stderr_fd >= 0) {
+        close(entry->stderr_fd);
+        entry->stderr_fd = -1;
     }
 
     pthread_mutex_lock(&pm->mutex);
     entry->active = 0;
     pthread_mutex_unlock(&pm->mutex);
 
-    broadcast_status(pm, entry->host, "inactive", exit_code);
+    if (exit_code != 0 && !declared_active) {
+        /* SSH è morto durante la connessione → errore */
+        broadcast_status_msg(pm, entry->host, "error", exit_code, errmsg);
+        /* Dopo un breve ritardo, manda anche "inactive" per resettare la UI */
+        usleep(100000);
+    }
+
+    broadcast_status_msg(pm, entry->host, "inactive", exit_code,
+                          exit_code != 0 ? errmsg : NULL);
+    free(errmsg);
     return NULL;
 }
 
 /* -------------------------------------------------------------------------
  * process_manager_create
  * ---------------------------------------------------------------------- */
-process_manager_t *process_manager_create(sse_broadcaster_t *sse)
+process_manager_t *process_manager_create(sse_broadcaster_t *sse,
+                                           const char *askpass_path)
 {
     process_manager_t *pm = calloc(1, sizeof(*pm));
     if (!pm)
         return NULL;
 
     pm->sse = sse;
+    if (askpass_path)
+        snprintf(pm->askpass_path, sizeof(pm->askpass_path), "%s", askpass_path);
 
     if (pthread_mutex_init(&pm->mutex, NULL) != 0) {
         free(pm);
@@ -128,7 +202,10 @@ process_manager_t *process_manager_create(sse_broadcaster_t *sse)
 /* -------------------------------------------------------------------------
  * process_manager_start_tunnel
  *
- * Costruisce l'argv per ssh e poi esegue fork/exec.
+ * Avvia un tunnel SSH usando l'alias Host come destinazione, così SSH
+ * legge direttamente ~/.ssh/config e applica tutte le direttive
+ * (HostName, User, Port, LocalForward, RemoteForward, DynamicForward, ecc.).
+ *
  * Nel figlio: execvp("ssh", argv) + _exit(127).
  * Nel padre: registra il tunnel, invia SSE "starting", lancia thread monitor.
  *
@@ -158,197 +235,107 @@ int process_manager_start_tunnel(process_manager_t *pm, const ssh_host_t *host)
         }
     }
 
-    if (pm->num_tunnels >= MAX_TUNNELS) {
-        pthread_mutex_unlock(&pm->mutex);
-        fprintf(stderr, "process_manager: raggiunto MAX_TUNNELS (%d)\n",
-                MAX_TUNNELS);
-        return -1;
+    /* Cerca uno slot inattivo da riutilizzare */
+    int slot = -1;
+    for (int i = 0; i < pm->num_tunnels; i++) {
+        if (!pm->tunnels[i].active) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        if (pm->num_tunnels >= MAX_TUNNELS) {
+            pthread_mutex_unlock(&pm->mutex);
+            fprintf(stderr, "process_manager: raggiunto MAX_TUNNELS (%d)\n",
+                    MAX_TUNNELS);
+            return -1;
+        }
+        slot = pm->num_tunnels++;
     }
 
     pthread_mutex_unlock(&pm->mutex);
 
     /*
      * Costruzione argv per ssh.
-     * Slot massimi: "ssh" + opzioni fisse (6) + port (-p N, 2) +
-     * identity (-i path, 2) + ProxyJump (-J host, 2) +
-     * -L/-R per forward (MAX_FORWARDS * 2 ciascuno) +
-     * -D per dynamic (MAX_FORWARDS * 2) +
-     * host name + NULL
+     *
+     * Usiamo l'alias Host (host->name) come destinazione, così SSH legge
+     * direttamente ~/.ssh/config e applica HostName, User, Port,
+     * IdentityFile, ProxyJump, LocalForward, RemoteForward, DynamicForward
+     * e tutte le altre direttive. Noi aggiungiamo solo -N (no shell) e
+     * le opzioni di robustezza che non sono tipicamente nel config utente.
      */
-    int max_args = 1 /* ssh */
-                 + 6 /* -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 */
-                 + 2 /* -p port */
-                 + 2 /* -l user */
-                 + 2 /* -i identity */
-                 + 2 /* -J proxyjump */
-                 + host->num_local_forward   * 2
-                 + host->num_remote_forward  * 2
-                 + host->num_dynamic_forward * 2
-                 + 1 /* hostname/alias */
-                 + 1 /* NULL sentinel */;
+    char *argv[] = {
+        "ssh",
+        "-N",
+        "-o", "ExitOnForwardFailure=yes",
+        "-o", "ConnectTimeout=10",
+        "-o", "ServerAliveInterval=30",
+        "-o", "ServerAliveCountMax=3",
+        (char *)host->name,
+        NULL
+    };
 
-    char **argv = calloc((size_t)max_args, sizeof(char *));
-    if (!argv)
-        return -1;
-
-    /*
-     * Buffer di supporto per le stringhe dei forward.
-     * Alloca un array di stringhe da liberare dopo exec/errore.
-     */
-    int   nfwd_bufs = host->num_local_forward
-                    + host->num_remote_forward
-                    + host->num_dynamic_forward;
-    char **fwd_bufs = calloc((size_t)(nfwd_bufs + 1), sizeof(char *));
-    if (!fwd_bufs) {
-        free(argv);
-        return -1;
+    /* Pipe per catturare stderr di SSH (messaggi di errore) */
+    int stderr_pipe[2] = {-1, -1};
+    if (pipe(stderr_pipe) != 0) {
+        perror("pipe");
+        /* Non fatale: proseguiamo senza cattura stderr */
+        stderr_pipe[0] = stderr_pipe[1] = -1;
     }
-    int buf_idx = 0;
-
-    int argc = 0;
-    argv[argc++] = "ssh";
-
-    /* Modalità no-shell (tunnel only) */
-    argv[argc++] = "-N";
-
-    /* Opzioni di robustezza */
-    argv[argc++] = "-o";
-    argv[argc++] = "ExitOnForwardFailure=yes";
-    argv[argc++] = "-o";
-    argv[argc++] = "ServerAliveInterval=30";
-    argv[argc++] = "-o";
-    argv[argc++] = "ServerAliveCountMax=3";
-
-    /* Porta SSH non standard */
-    if (host->port > 0 && host->port != 22) {
-        argv[argc++] = "-p";
-
-        char *port_str = malloc(16);
-        if (!port_str) goto oom;
-        fwd_bufs[buf_idx++] = port_str;
-        snprintf(port_str, 16, "%d", host->port);
-        argv[argc++] = port_str;
-    }
-
-    /* Utente */
-    if (host->user[0] != '\0') {
-        argv[argc++] = "-l";
-        argv[argc++] = (char *)host->user; /* punta direttamente alla struct */
-    }
-
-    /* Identity file */
-    if (host->identity_file[0] != '\0') {
-        argv[argc++] = "-i";
-        argv[argc++] = (char *)host->identity_file;
-    }
-
-    /* ProxyJump */
-    if (host->proxy_jump[0] != '\0') {
-        argv[argc++] = "-J";
-        argv[argc++] = (char *)host->proxy_jump;
-    }
-
-    /* Forward locali: -L [bind_addr:]bind_port:remote_host:remote_port */
-    for (int i = 0; i < host->num_local_forward; i++) {
-        const forward_rule_t *r = &host->local_forward[i];
-        char *s = malloc(512);
-        if (!s) goto oom;
-        fwd_bufs[buf_idx++] = s;
-
-        if (r->bind_addr[0] != '\0')
-            snprintf(s, 512, "%s:%d:%s:%d",
-                     r->bind_addr, r->bind_port,
-                     r->remote_host, r->remote_port);
-        else
-            snprintf(s, 512, "%d:%s:%d",
-                     r->bind_port, r->remote_host, r->remote_port);
-
-        argv[argc++] = "-L";
-        argv[argc++] = s;
-    }
-
-    /* Forward remoti: -R [bind_addr:]bind_port:remote_host:remote_port */
-    for (int i = 0; i < host->num_remote_forward; i++) {
-        const forward_rule_t *r = &host->remote_forward[i];
-        char *s = malloc(512);
-        if (!s) goto oom;
-        fwd_bufs[buf_idx++] = s;
-
-        if (r->bind_addr[0] != '\0')
-            snprintf(s, 512, "%s:%d:%s:%d",
-                     r->bind_addr, r->bind_port,
-                     r->remote_host, r->remote_port);
-        else
-            snprintf(s, 512, "%d:%s:%d",
-                     r->bind_port, r->remote_host, r->remote_port);
-
-        argv[argc++] = "-R";
-        argv[argc++] = s;
-    }
-
-    /* Forward dinamici (SOCKS): -D [bind_addr:]bind_port */
-    for (int i = 0; i < host->num_dynamic_forward; i++) {
-        const dynamic_rule_t *r = &host->dynamic_forward[i];
-        char *s = malloc(128);
-        if (!s) goto oom;
-        fwd_bufs[buf_idx++] = s;
-
-        if (r->bind_addr[0] != '\0')
-            snprintf(s, 128, "%s:%d", r->bind_addr, r->bind_port);
-        else
-            snprintf(s, 128, "%d", r->bind_port);
-
-        argv[argc++] = "-D";
-        argv[argc++] = s;
-    }
-
-    /*
-     * Hostname di destinazione: se hostname esplicitamente specificato
-     * usiamo quello, altrimenti usiamo il name (che ssh risolverà via
-     * ~/.ssh/config o DNS).
-     */
-    if (host->hostname[0] != '\0')
-        argv[argc++] = (char *)host->hostname;
-    else
-        argv[argc++] = (char *)host->name;
-
-    argv[argc] = NULL;
 
     /* Fork */
     pid_t pid = fork();
     if (pid < 0) {
         perror("fork");
-        goto cleanup;
+        if (stderr_pipe[0] >= 0) { close(stderr_pipe[0]); close(stderr_pipe[1]); }
+        return -1;
     }
 
     if (pid == 0) {
-        /* Figlio: esegui ssh */
+        /* Figlio: stacca dal terminale così SSH non può leggere la
+         * password da stdin e sarà costretto a usare SSH_ASKPASS. */
+        setsid();
+
+        /* Redirect stderr sulla pipe */
+        if (stderr_pipe[1] >= 0) {
+            close(stderr_pipe[0]); /* chiudi lato lettura nel figlio */
+            dup2(stderr_pipe[1], STDERR_FILENO);
+            close(stderr_pipe[1]);
+        }
+
+        /* Imposta lo script askpass come handler per le richieste password */
+        if (pm->askpass_path[0] != '\0') {
+            setenv("SSH_ASKPASS", pm->askpass_path, 1);
+            setenv("SSH_ASKPASS_REQUIRE", "force", 1);
+            /* DISPLAY serve perché SSH usa SSH_ASKPASS solo se è settato */
+            if (!getenv("DISPLAY"))
+                setenv("DISPLAY", ":0", 0);
+        }
+
+        /* Chiudi stdin per evitare che SSH tenti di leggere dal terminale */
+        close(STDIN_FILENO);
+
         execvp("ssh", argv);
         _exit(127);
     }
 
-    /* Padre */
+    /* Padre: chiudi il lato scrittura della pipe */
+    if (stderr_pipe[1] >= 0) close(stderr_pipe[1]);
 
-    /* Libera i buffer dei forward (il figlio ne ha già una copia via exec) */
-    for (int i = 0; i < buf_idx; i++)
-        free(fwd_bufs[i]);
-    free(fwd_bufs);
-    free(argv);
-
-    /* Registra il tunnel */
+    /* Padre: registra il tunnel */
     {
         tunnel_entry_t *entry;
         monitor_arg_t  *marg;
         pthread_t       tid;
 
         pthread_mutex_lock(&pm->mutex);
-        entry = &pm->tunnels[pm->num_tunnels];
+        entry = &pm->tunnels[slot];
         memset(entry, 0, sizeof(*entry));
         snprintf(entry->host, sizeof(entry->host), "%s", host->name);
-        entry->pid    = pid;
-        entry->active = 1;
-        entry->pm     = pm;
-        pm->num_tunnels++;
+        entry->pid       = pid;
+        entry->active    = 1;
+        entry->stderr_fd = stderr_pipe[0]; /* lato lettura della pipe */
+        entry->pm        = pm;
         pthread_mutex_unlock(&pm->mutex);
 
         /* Broadcast SSE: stato "starting" */
@@ -386,16 +373,6 @@ int process_manager_start_tunnel(process_manager_t *pm, const ssh_host_t *host)
     }
 
     return 0;
-
-oom:
-    fprintf(stderr, "process_manager: out of memory durante build argv\n");
-
-cleanup:
-    for (int i = 0; i < buf_idx; i++)
-        free(fwd_bufs[i]);
-    free(fwd_bufs);
-    free(argv);
-    return -1;
 }
 
 /* -------------------------------------------------------------------------
@@ -415,7 +392,10 @@ int process_manager_stop_tunnel(process_manager_t *pm, const char *host_name)
     for (int i = 0; i < pm->num_tunnels; i++) {
         tunnel_entry_t *e = &pm->tunnels[i];
         if (e->active && strcmp(e->host, host_name) == 0) {
-            kill(e->pid, SIGTERM);
+            /* Kill dell'intero process group (SSH + askpass + curl).
+             * setsid() nel figlio ha creato un nuovo process group
+             * con PGID == PID di SSH, quindi -pid killa tutto il gruppo. */
+            kill(-(e->pid), SIGTERM);
             found = 1;
             break;
         }
@@ -464,11 +444,11 @@ void process_manager_kill_all(process_manager_t *pm)
 
     pthread_mutex_lock(&pm->mutex);
 
-    /* Prima passata: SIGTERM */
+    /* Prima passata: SIGTERM all'intero process group */
     for (int i = 0; i < pm->num_tunnels; i++) {
         tunnel_entry_t *e = &pm->tunnels[i];
         if (e->active && e->pid > 0)
-            kill(e->pid, SIGTERM);
+            kill(-(e->pid), SIGTERM);
     }
 
     pthread_mutex_unlock(&pm->mutex);
@@ -488,8 +468,8 @@ void process_manager_kill_all(process_manager_t *pm)
         int   wstatus = 0;
         pid_t r = waitpid(e->pid, &wstatus, WNOHANG);
         if (r == 0) {
-            /* Ancora in vita */
-            kill(e->pid, SIGKILL);
+            /* Ancora in vita: SIGKILL all'intero group */
+            kill(-(e->pid), SIGKILL);
             waitpid(e->pid, &wstatus, 0); /* raccoglie il zombie */
         }
         e->active = 0;
