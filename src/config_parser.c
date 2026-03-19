@@ -446,3 +446,331 @@ void ssh_hosts_free(ssh_host_t *hosts, int count)
     (void)count; /* suppress unused-parameter warning */
     free(hosts);
 }
+
+/* -------------------------------------------------------------------------
+ * Serializzazione JSON (richiede json-c)
+ * ---------------------------------------------------------------------- */
+
+#include <json-c/json.h>
+#include <sys/stat.h>
+#include <errno.h>
+
+/*
+ * ssh_hosts_to_json — serializza un array di ssh_host_t in una stringa JSON.
+ *
+ * I nomi dei campi JSON corrispondono a quelli usati in http_server.c.
+ * Il chiamante deve liberare la stringa restituita con free().
+ * Restituisce NULL in caso di errore di allocazione.
+ */
+char *ssh_hosts_to_json(const ssh_host_t *hosts, int count)
+{
+    json_object *jarr = json_object_new_array();
+    if (!jarr) return NULL;
+
+    for (int i = 0; i < count; i++) {
+        const ssh_host_t *h = &hosts[i];
+        json_object *jh = json_object_new_object();
+
+        json_object_object_add(jh, "name",         json_object_new_string(h->name));
+        json_object_object_add(jh, "hostname",     json_object_new_string(h->hostname));
+        json_object_object_add(jh, "user",         json_object_new_string(h->user));
+        json_object_object_add(jh, "port",         json_object_new_int(h->port ? h->port : 22));
+        json_object_object_add(jh, "identityFile", json_object_new_string(h->identity_file));
+        json_object_object_add(jh, "proxyJump",    json_object_new_string(h->proxy_jump));
+
+        /* LocalForward */
+        json_object *jlf = json_object_new_array();
+        for (int j = 0; j < h->num_local_forward; j++) {
+            json_object *jf = json_object_new_object();
+            json_object_object_add(jf, "bindAddr",   json_object_new_string(h->local_forward[j].bind_addr));
+            json_object_object_add(jf, "bindPort",   json_object_new_int(h->local_forward[j].bind_port));
+            json_object_object_add(jf, "remoteHost", json_object_new_string(h->local_forward[j].remote_host));
+            json_object_object_add(jf, "remotePort", json_object_new_int(h->local_forward[j].remote_port));
+            json_object_array_add(jlf, jf);
+        }
+        json_object_object_add(jh, "localForward", jlf);
+
+        /* RemoteForward */
+        json_object *jrf = json_object_new_array();
+        for (int j = 0; j < h->num_remote_forward; j++) {
+            json_object *jf = json_object_new_object();
+            json_object_object_add(jf, "bindAddr",   json_object_new_string(h->remote_forward[j].bind_addr));
+            json_object_object_add(jf, "bindPort",   json_object_new_int(h->remote_forward[j].bind_port));
+            json_object_object_add(jf, "remoteHost", json_object_new_string(h->remote_forward[j].remote_host));
+            json_object_object_add(jf, "remotePort", json_object_new_int(h->remote_forward[j].remote_port));
+            json_object_array_add(jrf, jf);
+        }
+        json_object_object_add(jh, "remoteForward", jrf);
+
+        /* DynamicForward */
+        json_object *jdf = json_object_new_array();
+        for (int j = 0; j < h->num_dynamic_forward; j++) {
+            json_object *jf = json_object_new_object();
+            json_object_object_add(jf, "bindAddr", json_object_new_string(h->dynamic_forward[j].bind_addr));
+            json_object_object_add(jf, "bindPort", json_object_new_int(h->dynamic_forward[j].bind_port));
+            json_object_array_add(jdf, jf);
+        }
+        json_object_object_add(jh, "dynamicForward", jdf);
+
+        json_object_array_add(jarr, jh);
+    }
+
+    /* Duplica la stringa prima di liberare l'oggetto json */
+    const char *tmp = json_object_to_json_string_ext(jarr, JSON_C_TO_STRING_PLAIN);
+    char *result = tmp ? strdup(tmp) : NULL;
+    json_object_put(jarr);
+    return result;
+}
+
+/*
+ * ssh_hosts_from_json — deserializza un array JSON in ssh_host_t[].
+ *
+ * Il chiamante deve liberare il risultato con ssh_hosts_free().
+ * Restituisce NULL in caso di errore (json non valido o OOM).
+ */
+ssh_host_t *ssh_hosts_from_json(const char *json_str, int *out_count)
+{
+    *out_count = 0;
+    if (!json_str) return NULL;
+
+    json_object *jarr = json_tokener_parse(json_str);
+    if (!jarr || !json_object_is_type(jarr, json_type_array)) {
+        if (jarr) json_object_put(jarr);
+        return NULL;
+    }
+
+    int count = (int)json_object_array_length(jarr);
+    ssh_host_t *hosts = calloc((size_t)count + 1, sizeof(ssh_host_t));
+    if (!hosts) { json_object_put(jarr); return NULL; }
+
+    for (int i = 0; i < count; i++) {
+        ssh_host_t  *h  = &hosts[i];
+        json_object *jh = json_object_array_get_idx(jarr, i);
+        if (!jh) continue;
+
+        json_object *jv;
+
+        /* Campi scalari */
+        if (json_object_object_get_ex(jh, "name", &jv))
+            snprintf(h->name, sizeof(h->name), "%s", json_object_get_string(jv));
+        if (json_object_object_get_ex(jh, "hostname", &jv))
+            snprintf(h->hostname, sizeof(h->hostname), "%s", json_object_get_string(jv));
+        if (json_object_object_get_ex(jh, "user", &jv))
+            snprintf(h->user, sizeof(h->user), "%s", json_object_get_string(jv));
+        if (json_object_object_get_ex(jh, "port", &jv))
+            h->port = json_object_get_int(jv);
+        if (json_object_object_get_ex(jh, "identityFile", &jv))
+            snprintf(h->identity_file, sizeof(h->identity_file), "%s", json_object_get_string(jv));
+        if (json_object_object_get_ex(jh, "proxyJump", &jv))
+            snprintf(h->proxy_jump, sizeof(h->proxy_jump), "%s", json_object_get_string(jv));
+
+        /* LocalForward */
+        json_object *jlf;
+        if (json_object_object_get_ex(jh, "localForward", &jlf) &&
+            json_object_is_type(jlf, json_type_array)) {
+            int n = (int)json_object_array_length(jlf);
+            if (n > MAX_FORWARDS) n = MAX_FORWARDS;
+            for (int j = 0; j < n; j++) {
+                json_object    *jf = json_object_array_get_idx(jlf, j);
+                forward_rule_t *r  = &h->local_forward[j];
+                if (json_object_object_get_ex(jf, "bindAddr", &jv))
+                    snprintf(r->bind_addr, sizeof(r->bind_addr), "%s", json_object_get_string(jv));
+                if (json_object_object_get_ex(jf, "bindPort", &jv))
+                    r->bind_port = json_object_get_int(jv);
+                if (json_object_object_get_ex(jf, "remoteHost", &jv))
+                    snprintf(r->remote_host, sizeof(r->remote_host), "%s", json_object_get_string(jv));
+                if (json_object_object_get_ex(jf, "remotePort", &jv))
+                    r->remote_port = json_object_get_int(jv);
+                h->num_local_forward++;
+            }
+        }
+
+        /* RemoteForward */
+        json_object *jrf;
+        if (json_object_object_get_ex(jh, "remoteForward", &jrf) &&
+            json_object_is_type(jrf, json_type_array)) {
+            int n = (int)json_object_array_length(jrf);
+            if (n > MAX_FORWARDS) n = MAX_FORWARDS;
+            for (int j = 0; j < n; j++) {
+                json_object    *jf = json_object_array_get_idx(jrf, j);
+                forward_rule_t *r  = &h->remote_forward[j];
+                if (json_object_object_get_ex(jf, "bindAddr", &jv))
+                    snprintf(r->bind_addr, sizeof(r->bind_addr), "%s", json_object_get_string(jv));
+                if (json_object_object_get_ex(jf, "bindPort", &jv))
+                    r->bind_port = json_object_get_int(jv);
+                if (json_object_object_get_ex(jf, "remoteHost", &jv))
+                    snprintf(r->remote_host, sizeof(r->remote_host), "%s", json_object_get_string(jv));
+                if (json_object_object_get_ex(jf, "remotePort", &jv))
+                    r->remote_port = json_object_get_int(jv);
+                h->num_remote_forward++;
+            }
+        }
+
+        /* DynamicForward */
+        json_object *jdf;
+        if (json_object_object_get_ex(jh, "dynamicForward", &jdf) &&
+            json_object_is_type(jdf, json_type_array)) {
+            int n = (int)json_object_array_length(jdf);
+            if (n > MAX_FORWARDS) n = MAX_FORWARDS;
+            for (int j = 0; j < n; j++) {
+                json_object    *jf = json_object_array_get_idx(jdf, j);
+                dynamic_rule_t *r  = &h->dynamic_forward[j];
+                if (json_object_object_get_ex(jf, "bindAddr", &jv))
+                    snprintf(r->bind_addr, sizeof(r->bind_addr), "%s", json_object_get_string(jv));
+                if (json_object_object_get_ex(jf, "bindPort", &jv))
+                    r->bind_port = json_object_get_int(jv);
+                h->num_dynamic_forward++;
+            }
+        }
+    }
+
+    json_object_put(jarr);
+    *out_count = count;
+    return hosts;
+}
+
+/* -------------------------------------------------------------------------
+ * Scrittura SSH config
+ * ---------------------------------------------------------------------- */
+
+/*
+ * copy_file — copia src in dst in modalità binaria.
+ * Restituisce 0 in caso di successo, -1 in caso di errore.
+ */
+static int copy_file(const char *src, const char *dst)
+{
+    FILE *in  = fopen(src, "rb");
+    if (!in) return -1;
+    FILE *out = fopen(dst, "wb");
+    if (!out) { fclose(in); return -1; }
+
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            fclose(in); fclose(out);
+            return -1;
+        }
+    }
+    fclose(in);
+    fclose(out);
+    return 0;
+}
+
+/*
+ * ssh_hosts_write_config — scrive un array di ssh_host_t in formato
+ * OpenSSH client config.
+ *
+ * Se path è NULL viene usato ~/.ssh/config.
+ * Se il file di destinazione esiste viene prima copiato come <path>.bak.
+ * La directory ~/.ssh/ viene creata con permessi 0700 se non esiste.
+ * Il file scritto riceve permessi 0600.
+ *
+ * Restituisce 0 in caso di successo, -1 in caso di errore.
+ */
+int ssh_hosts_write_config(const ssh_host_t *hosts, int count, const char *path)
+{
+    /* --- Risolvi il path di destinazione --- */
+    char resolved[1024];
+    if (!path || path[0] == '\0') {
+        expand_tilde(resolved, "~/.ssh/config", sizeof(resolved));
+    } else {
+        expand_tilde(resolved, path, sizeof(resolved));
+    }
+
+    /* --- Crea ~/.ssh/ con permessi 0700 se necessario --- */
+    char ssh_dir[1024];
+    snprintf(ssh_dir, sizeof(ssh_dir), "%s", resolved);
+    /* Trova l'ultima '/' per ricavare la directory padre */
+    char *last_slash = strrchr(ssh_dir, '/');
+    if (last_slash && last_slash != ssh_dir) {
+        *last_slash = '\0';
+        if (mkdir(ssh_dir, 0700) != 0 && errno != EEXIST) {
+            return -1;
+        }
+    }
+
+    /* --- Backup del file esistente --- */
+    char bak_path[1024];
+    snprintf(bak_path, sizeof(bak_path), "%s.bak", resolved);
+    if (access(resolved, F_OK) == 0) {
+        if (copy_file(resolved, bak_path) != 0) {
+            return -1;
+        }
+    }
+
+    /* --- Scrittura del nuovo file --- */
+    FILE *fp = fopen(resolved, "w");
+    if (!fp) return -1;
+
+    /* Intestazione */
+    fprintf(fp, "# Generato da SSHPad — non modificare manualmente\n");
+
+    for (int i = 0; i < count; i++) {
+        const ssh_host_t *h = &hosts[i];
+
+        /* Riga vuota di separazione tra host (tranne prima del primo) */
+        fprintf(fp, "\n");
+
+        fprintf(fp, "Host %s\n", h->name);
+
+        /* HostName — ometti se uguale all'alias */
+        if (h->hostname[0] != '\0' &&
+            strcmp(h->hostname, h->name) != 0) {
+            fprintf(fp, "    HostName %s\n", h->hostname);
+        }
+
+        /* User — ometti se vuoto */
+        if (h->user[0] != '\0')
+            fprintf(fp, "    User %s\n", h->user);
+
+        /* Port — ometti se 0 o 22 */
+        if (h->port != 0 && h->port != 22)
+            fprintf(fp, "    Port %d\n", h->port);
+
+        /* IdentityFile — ometti se vuoto */
+        if (h->identity_file[0] != '\0')
+            fprintf(fp, "    IdentityFile %s\n", h->identity_file);
+
+        /* ProxyJump — ometti se vuoto */
+        if (h->proxy_jump[0] != '\0')
+            fprintf(fp, "    ProxyJump %s\n", h->proxy_jump);
+
+        /* LocalForward */
+        for (int j = 0; j < h->num_local_forward; j++) {
+            const forward_rule_t *r = &h->local_forward[j];
+            fprintf(fp, "    LocalForward %s:%d %s:%d\n",
+                    r->bind_addr, r->bind_port,
+                    r->remote_host, r->remote_port);
+        }
+
+        /* RemoteForward */
+        for (int j = 0; j < h->num_remote_forward; j++) {
+            const forward_rule_t *r = &h->remote_forward[j];
+            fprintf(fp, "    RemoteForward %s:%d %s:%d\n",
+                    r->bind_addr, r->bind_port,
+                    r->remote_host, r->remote_port);
+        }
+
+        /* DynamicForward */
+        for (int j = 0; j < h->num_dynamic_forward; j++) {
+            const dynamic_rule_t *r = &h->dynamic_forward[j];
+            fprintf(fp, "    DynamicForward %s:%d\n",
+                    r->bind_addr, r->bind_port);
+        }
+
+        /* Opzioni generiche */
+        for (int j = 0; j < h->num_options; j++) {
+            fprintf(fp, "    %s %s\n",
+                    h->options[j].key,
+                    h->options[j].value);
+        }
+    }
+
+    fclose(fp);
+
+    /* Imposta permessi 0600 sul file scritto */
+    chmod(resolved, 0600);
+
+    return 0;
+}

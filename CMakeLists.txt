@@ -10,6 +10,7 @@ pkg_check_modules(WEBKIT  REQUIRED webkitgtk-6.0)
 pkg_check_modules(MHD     REQUIRED libmicrohttpd)
 pkg_check_modules(JSONC   REQUIRED json-c)
 pkg_check_modules(OPENSSL REQUIRED openssl)
+pkg_check_modules(CURL    REQUIRED libcurl)
 pkg_check_modules(X11 x11)
 
 add_executable(sshpad
@@ -24,6 +25,9 @@ add_executable(sshpad
     src/util.c
     src/window_state.c
     src/local_proxy.c
+    src/r2_client.c
+    src/crypto_store.c
+    src/config_manager.c
 )
 
 target_include_directories(sshpad PRIVATE
@@ -32,6 +36,7 @@ target_include_directories(sshpad PRIVATE
     ${MHD_INCLUDE_DIRS}
     ${JSONC_INCLUDE_DIRS}
     ${OPENSSL_INCLUDE_DIRS}
+    ${CURL_INCLUDE_DIRS}
     src/
 )
 
@@ -41,6 +46,7 @@ target_compile_options(sshpad PRIVATE
     ${MHD_CFLAGS_OTHER}
     ${JSONC_CFLAGS_OTHER}
     ${OPENSSL_CFLAGS_OTHER}
+    ${CURL_CFLAGS_OTHER}
 )
 
 target_link_libraries(sshpad
@@ -49,6 +55,7 @@ target_link_libraries(sshpad
     ${MHD_LIBRARIES}
     ${JSONC_LIBRARIES}
     ${OPENSSL_LIBRARIES}
+    ${CURL_LIBRARIES}
     ${X11_LIBRARIES}
     pthread
 )

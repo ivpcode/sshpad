@@ -3,10 +3,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <curl/curl.h>
 #include "http_server.h"
 #include "app_context.h"
 #include "port_finder.h"
-#include "config_parser.h"
+#include "config_manager.h"
 #include "process_manager.h"
 #include "sse.h"
 #include "askpass.h"
@@ -49,7 +50,8 @@ static void cleanup(app_context_t *ctx) {
     process_manager_kill_all(ctx->pm);
     process_manager_free(ctx->pm);
     sse_broadcaster_free(ctx->sse);
-    ssh_hosts_free(ctx->hosts, ctx->num_hosts);
+    cm_free(ctx->cm);
+    curl_global_cleanup();
     askpass_cleanup(ctx->askpass_path);
 }
 
@@ -132,6 +134,8 @@ int main(int argc, char *argv[]) {
 
     app_context_t ctx = {0};
 
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+
     ctx.port = find_free_port("127.0.0.1");
     if (ctx.port < 0) {
         fprintf(stderr, "Impossibile trovare una porta libera\n");
@@ -139,14 +143,14 @@ int main(int argc, char *argv[]) {
     }
     printf("Porta selezionata: %d\n", ctx.port);
 
-    ctx.hosts = parse_ssh_config(NULL, &ctx.num_hosts);
+    ctx.sse = sse_broadcaster_create();
+    ctx.cm = cm_create(ctx.sse);
 
     if (askpass_init(ctx.askpass_path, ctx.port) != 0) {
         fprintf(stderr, "Impossibile inizializzare askpass\n");
         return 1;
     }
 
-    ctx.sse = sse_broadcaster_create();
     ctx.pm = process_manager_create(ctx.sse, ctx.askpass_path);
 
     ctx.httpd = http_server_start(ctx.port, &ctx);
@@ -157,7 +161,9 @@ int main(int argc, char *argv[]) {
 
     /* HTTPS reverse proxy (opzionale: richiede mkcert) */
     if (lp_check_mkcert() == 0) {
-        ctx.proxy = lp_create(ctx.hosts, ctx.num_hosts, ctx.sse);
+        int lp_host_count = 0;
+        const ssh_host_t *lp_hosts = cm_get_hosts(ctx.cm, &lp_host_count);
+        ctx.proxy = lp_create(lp_hosts, lp_host_count, ctx.sse);
         if (ctx.proxy) {
             if (lp_start(ctx.proxy) != 0)
                 fprintf(stderr, "HTTPS proxy non avviato\n");

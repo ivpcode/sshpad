@@ -14,5 +14,9 @@ import './components/sshpad-card.js';
 import './components/sshpad-password.js';
 import './components/sshpad-toast.js';
 import './components/sshpad-app.js';
+import './components/sshpad-wizard.js';
+import './components/sshpad-unlock.js';
+import './components/sshpad-host-editor.js';
+import './components/sshpad-r2-settings.js';
 
 console.info('SSHPad UI loaded');

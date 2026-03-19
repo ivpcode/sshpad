@@ -10,6 +10,7 @@ class SshpadCard extends IVPLitElementBase {
             host:         { type: Object },
             status:       { type: String },
             errorMessage: { type: String },
+            editable:     { type: Boolean },
         };
     }
 
@@ -18,12 +19,31 @@ class SshpadCard extends IVPLitElementBase {
         this.host         = {};
         this.status       = 'inactive';
         this.errorMessage = '';
+        this.editable     = false;
     }
 
     _toggleTunnel(e) {
         const eventName = e.target.checked ? 'tunnel-start' : 'tunnel-stop';
         this.dispatchEvent(new CustomEvent(eventName, {
             detail:   { host: this.host.name },
+            bubbles:  true,
+            composed: true,
+        }));
+    }
+
+    _edit(e) {
+        e.stopPropagation();
+        this.dispatchEvent(new CustomEvent('host-edit', {
+            detail:   { host: this.host },
+            bubbles:  true,
+            composed: true,
+        }));
+    }
+
+    _delete(e) {
+        e.stopPropagation();
+        this.dispatchEvent(new CustomEvent('host-delete', {
+            detail:   { name: this.host.name },
             bubbles:  true,
             composed: true,
         }));
@@ -66,6 +86,18 @@ class SshpadCard extends IVPLitElementBase {
                         ${this.host.name}
                     </span>
                     <div class="d-flex align-items-center gap-2">
+                        ${this.editable ? html`
+                            <button class="btn btn-outline-primary btn-sm"
+                                    @click=${this._edit}
+                                    title="Modifica">
+                                <i class="bi bi-pencil"></i>
+                            </button>
+                            <button class="btn btn-outline-danger btn-sm"
+                                    @click=${this._delete}
+                                    title="Elimina">
+                                <i class="bi bi-trash"></i>
+                            </button>
+                        ` : ''}
                         <button class="btn btn-outline-success btn-sm font-monospace"
                                 ?disabled=${this.status === 'starting'}
                                 @click=${this._openTerminal}

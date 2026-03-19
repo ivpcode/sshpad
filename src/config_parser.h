@@ -45,4 +45,11 @@ typedef struct {
 ssh_host_t *parse_ssh_config(const char *path, int *out_count);
 void ssh_hosts_free(ssh_host_t *hosts, int count);
 
+/* --- Serializzazione JSON --- */
+ssh_host_t *ssh_hosts_from_json(const char *json_str, int *out_count);
+char       *ssh_hosts_to_json(const ssh_host_t *hosts, int count);
+
+/* --- Scrittura SSH config --- */
+int ssh_hosts_write_config(const ssh_host_t *hosts, int count, const char *path);
+
 #endif /* CONFIG_PARSER_H */

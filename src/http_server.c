@@ -15,6 +15,8 @@
 #include "app_context.h"
 #include "sse.h"
 #include "config_parser.h"
+#include "config_manager.h"
+#include "r2_client.h"
 #include "process_manager.h"
 #include "terminal_launch.h"
 #include "askpass.h"
@@ -201,10 +203,13 @@ serve_static(struct MHD_Connection *conn, const char *url)
 static enum MHD_Result
 handle_get_hosts(struct MHD_Connection *conn, app_context_t *ctx)
 {
+    int count = 0;
+    const ssh_host_t *hosts = cm_get_hosts(ctx->cm, &count);
+
     json_object *jarr = json_object_new_array();
 
-    for (int i = 0; i < ctx->num_hosts; i++) {
-        ssh_host_t  *h  = &ctx->hosts[i];
+    for (int i = 0; i < count; i++) {
+        const ssh_host_t *h = &hosts[i];
         json_object *jh = json_object_new_object();
 
         json_object_object_add(jh, "name",
@@ -296,10 +301,12 @@ handle_sse(struct MHD_Connection *conn, app_context_t *ctx)
 static enum MHD_Result
 handle_get_status(struct MHD_Connection *conn, app_context_t *ctx)
 {
+    int count = 0;
+    cm_get_hosts(ctx->cm, &count);
     char buf[128];
     snprintf(buf, sizeof(buf),
              "{\"status\":\"ok\",\"numHosts\":%d,\"port\":%d}",
-             ctx->num_hosts, ctx->port);
+             count, ctx->port);
     return json_response(conn, MHD_HTTP_OK, buf);
 }
 
@@ -327,10 +334,12 @@ handle_internal_askpass(struct MHD_Connection *conn, app_context_t *ctx)
      * Il prompt ha la forma "user@hostname's password:" oppure
      * "Password for user@hostname:" — estraiamo hostname e cerchiamo
      * tra gli host del config quale ha quel HostName. */
+    int count = 0;
+    const ssh_host_t *hosts = cm_get_hosts(ctx->cm, &count);
     const char *host_alias = "";
     if (prompt) {
-        for (int i = 0; i < ctx->num_hosts; i++) {
-            const ssh_host_t *h = &ctx->hosts[i];
+        for (int i = 0; i < count; i++) {
+            const ssh_host_t *h = &hosts[i];
             /* Cerca hostname o nome alias nel prompt */
             if ((h->hostname[0] && strstr(prompt, h->hostname)) ||
                 strstr(prompt, h->name)) {
@@ -403,10 +412,12 @@ handle_tunnel_start(struct MHD_Connection *conn, const char *body,
     const char *host_name = json_object_get_string(jhost);
 
     /* Cerca l'host per nome */
-    ssh_host_t *found = NULL;
-    for (int i = 0; i < ctx->num_hosts; i++) {
-        if (strcmp(ctx->hosts[i].name, host_name) == 0) {
-            found = &ctx->hosts[i];
+    int count = 0;
+    const ssh_host_t *hosts = cm_get_hosts(ctx->cm, &count);
+    const ssh_host_t *found = NULL;
+    for (int i = 0; i < count; i++) {
+        if (strcmp(hosts[i].name, host_name) == 0) {
+            found = &hosts[i];
             break;
         }
     }
@@ -544,6 +555,344 @@ handle_password(struct MHD_Connection *conn, const char *body,
 }
 
 /* ------------------------------------------------------------------ */
+/* GET /api/config/status                                              */
+/* ------------------------------------------------------------------ */
+static enum MHD_Result
+handle_config_status(struct MHD_Connection *conn, app_context_t *ctx)
+{
+    cm_mode_t mode = cm_get_mode(ctx->cm);
+    const char *mode_str;
+    switch (mode) {
+        case CM_MODE_FIRST_RUN: mode_str = "first_run"; break;
+        case CM_MODE_LOCKED:    mode_str = "locked";    break;
+        case CM_MODE_CLOUD:     mode_str = "cloud";     break;
+        case CM_MODE_LOCAL:     mode_str = "local";     break;
+        default:                mode_str = "local";     break;
+    }
+    r2_config_t r2 = {0};
+    cm_get_r2_config(ctx->cm, &r2);
+    int r2_configured = (r2.endpoint[0] != '\0') ? 1 : 0;
+
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "{\"mode\":\"%s\",\"r2Configured\":%s}",
+             mode_str, r2_configured ? "true" : "false");
+    return json_response(conn, MHD_HTTP_OK, buf);
+}
+
+/* ------------------------------------------------------------------ */
+/* POST /api/config/setup — completa wizard primo avvio                */
+/* ------------------------------------------------------------------ */
+static enum MHD_Result
+handle_config_setup(struct MHD_Connection *conn, const char *body, app_context_t *ctx)
+{
+    if (!body || body[0] == '\0')
+        return json_response(conn, MHD_HTTP_BAD_REQUEST, "{\"error\":\"empty body\"}");
+
+    json_object *jreq = json_tokener_parse(body);
+    if (!jreq)
+        return json_response(conn, MHD_HTTP_BAD_REQUEST, "{\"error\":\"invalid JSON\"}");
+
+    json_object *jmode = NULL;
+    if (!json_object_object_get_ex(jreq, "mode", &jmode)) {
+        json_object_put(jreq);
+        return json_response(conn, MHD_HTTP_BAD_REQUEST, "{\"error\":\"missing field: mode\"}");
+    }
+    const char *mode = json_object_get_string(jmode);
+
+    if (strcmp(mode, "local") == 0) {
+        int rc = cm_setup(ctx->cm, "local", NULL, NULL);
+        json_object_put(jreq);
+        return rc == 0 ? json_response(conn, MHD_HTTP_OK, "{\"ok\":true}")
+                       : json_response(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, "{\"error\":\"setup failed\"}");
+    }
+
+    if (strcmp(mode, "cloud") == 0) {
+        json_object *jr2 = NULL, *jpwd = NULL;
+        if (!json_object_object_get_ex(jreq, "r2", &jr2) ||
+            !json_object_object_get_ex(jreq, "password", &jpwd)) {
+            json_object_put(jreq);
+            return json_response(conn, MHD_HTTP_BAD_REQUEST, "{\"error\":\"missing r2 or password\"}");
+        }
+
+        r2_config_t r2 = {0};
+        json_object *jv;
+        if (json_object_object_get_ex(jr2, "endpoint", &jv))
+            snprintf(r2.endpoint, sizeof(r2.endpoint), "%s", json_object_get_string(jv));
+        if (json_object_object_get_ex(jr2, "accessKeyId", &jv))
+            snprintf(r2.access_key_id, sizeof(r2.access_key_id), "%s", json_object_get_string(jv));
+        if (json_object_object_get_ex(jr2, "secretAccessKey", &jv))
+            snprintf(r2.secret_access_key, sizeof(r2.secret_access_key), "%s", json_object_get_string(jv));
+        if (json_object_object_get_ex(jr2, "bucket", &jv))
+            snprintf(r2.bucket, sizeof(r2.bucket), "%s", json_object_get_string(jv));
+        if (json_object_object_get_ex(jr2, "objectKey", &jv))
+            snprintf(r2.object_key, sizeof(r2.object_key), "%s", json_object_get_string(jv));
+        else
+            strncpy(r2.object_key, "sshpad-config.spd", sizeof(r2.object_key) - 1);
+
+        const char *password = json_object_get_string(jpwd);
+        int rc = cm_setup(ctx->cm, "cloud", &r2, password);
+        json_object_put(jreq);
+
+        if (rc == -1) return json_response(conn, MHD_HTTP_UNAUTHORIZED, "{\"error\":\"bad_password\"}");
+        if (rc < 0)   return json_response(conn, MHD_HTTP_BAD_GATEWAY, "{\"error\":\"network_error\"}");
+        return json_response(conn, MHD_HTTP_OK, "{\"ok\":true}");
+    }
+
+    json_object_put(jreq);
+    return json_response(conn, MHD_HTTP_BAD_REQUEST, "{\"error\":\"invalid mode\"}");
+}
+
+/* ------------------------------------------------------------------ */
+/* POST /api/config/unlock                                             */
+/* ------------------------------------------------------------------ */
+static enum MHD_Result
+handle_config_unlock(struct MHD_Connection *conn, const char *body, app_context_t *ctx)
+{
+    if (!body || body[0] == '\0')
+        return json_response(conn, MHD_HTTP_BAD_REQUEST, "{\"error\":\"empty body\"}");
+
+    json_object *jreq = json_tokener_parse(body);
+    if (!jreq)
+        return json_response(conn, MHD_HTTP_BAD_REQUEST, "{\"error\":\"invalid JSON\"}");
+
+    json_object *jpwd = NULL;
+    if (!json_object_object_get_ex(jreq, "password", &jpwd)) {
+        json_object_put(jreq);
+        return json_response(conn, MHD_HTTP_BAD_REQUEST, "{\"error\":\"missing field: password\"}");
+    }
+
+    const char *password = json_object_get_string(jpwd);
+    int rc = cm_unlock(ctx->cm, password);
+    json_object_put(jreq);
+
+    if (rc == -1) return json_response(conn, MHD_HTTP_UNAUTHORIZED, "{\"error\":\"bad_password\"}");
+    if (rc < 0)   return json_response(conn, MHD_HTTP_BAD_GATEWAY,  "{\"error\":\"network_error\"}");
+    return json_response(conn, MHD_HTTP_OK, "{\"ok\":true}");
+}
+
+/* ------------------------------------------------------------------ */
+/* POST /api/host/save                                                 */
+/* ------------------------------------------------------------------ */
+static enum MHD_Result
+handle_host_save(struct MHD_Connection *conn, const char *body, app_context_t *ctx)
+{
+    cm_mode_t mode = cm_get_mode(ctx->cm);
+    if (mode == CM_MODE_LOCKED)
+        return json_response(conn, MHD_HTTP_FORBIDDEN, "{\"error\":\"config not unlocked\"}");
+    if (mode == CM_MODE_FIRST_RUN)
+        return json_response(conn, MHD_HTTP_FORBIDDEN, "{\"error\":\"setup not completed\"}");
+
+    if (!body || body[0] == '\0')
+        return json_response(conn, MHD_HTTP_BAD_REQUEST, "{\"error\":\"empty body\"}");
+
+    /* Wrap in array for ssh_hosts_from_json */
+    size_t body_len = strlen(body);
+    char *arr_json = malloc(body_len + 3);
+    if (!arr_json)
+        return json_response(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, "{\"error\":\"out of memory\"}");
+    arr_json[0] = '[';
+    memcpy(arr_json + 1, body, body_len);
+    arr_json[body_len + 1] = ']';
+    arr_json[body_len + 2] = '\0';
+
+    int count = 0;
+    ssh_host_t *hosts = ssh_hosts_from_json(arr_json, &count);
+    free(arr_json);
+
+    if (!hosts || count == 0) {
+        free(hosts);
+        return json_response(conn, MHD_HTTP_BAD_REQUEST, "{\"error\":\"invalid host JSON\"}");
+    }
+    if (hosts[0].name[0] == '\0') {
+        free(hosts);
+        return json_response(conn, MHD_HTTP_BAD_REQUEST, "{\"error\":\"missing field: name\"}");
+    }
+
+    int rc = cm_save_host(ctx->cm, &hosts[0]);
+    free(hosts);
+
+    return rc == 0 ? json_response(conn, MHD_HTTP_OK, "{\"ok\":true}")
+                   : json_response(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, "{\"error\":\"save failed\"}");
+}
+
+/* ------------------------------------------------------------------ */
+/* POST /api/host/delete                                               */
+/* ------------------------------------------------------------------ */
+static enum MHD_Result
+handle_host_delete(struct MHD_Connection *conn, const char *body, app_context_t *ctx)
+{
+    cm_mode_t mode = cm_get_mode(ctx->cm);
+    if (mode == CM_MODE_LOCKED)
+        return json_response(conn, MHD_HTTP_FORBIDDEN, "{\"error\":\"config not unlocked\"}");
+    if (mode == CM_MODE_FIRST_RUN)
+        return json_response(conn, MHD_HTTP_FORBIDDEN, "{\"error\":\"setup not completed\"}");
+
+    if (!body || body[0] == '\0')
+        return json_response(conn, MHD_HTTP_BAD_REQUEST, "{\"error\":\"empty body\"}");
+
+    json_object *jreq = json_tokener_parse(body);
+    if (!jreq)
+        return json_response(conn, MHD_HTTP_BAD_REQUEST, "{\"error\":\"invalid JSON\"}");
+
+    json_object *jname = NULL;
+    if (!json_object_object_get_ex(jreq, "name", &jname)) {
+        json_object_put(jreq);
+        return json_response(conn, MHD_HTTP_BAD_REQUEST, "{\"error\":\"missing field: name\"}");
+    }
+
+    const char *name = json_object_get_string(jname);
+    int rc = cm_delete_host(ctx->cm, name);
+    json_object_put(jreq);
+
+    if (rc == -1) return json_response(conn, MHD_HTTP_NOT_FOUND, "{\"error\":\"host not found\"}");
+    return json_response(conn, MHD_HTTP_OK, "{\"ok\":true}");
+}
+
+/* ------------------------------------------------------------------ */
+/* POST /api/config/use-local                                          */
+/* ------------------------------------------------------------------ */
+static enum MHD_Result
+handle_config_use_local(struct MHD_Connection *conn, app_context_t *ctx)
+{
+    cm_use_local(ctx->cm);
+    return json_response(conn, MHD_HTTP_OK, "{\"ok\":true}");
+}
+
+/* ------------------------------------------------------------------ */
+/* POST /api/config/change-password                                    */
+/* ------------------------------------------------------------------ */
+static enum MHD_Result
+handle_config_change_password(struct MHD_Connection *conn, const char *body, app_context_t *ctx)
+{
+    if (!body || body[0] == '\0')
+        return json_response(conn, MHD_HTTP_BAD_REQUEST, "{\"error\":\"empty body\"}");
+
+    json_object *jreq = json_tokener_parse(body);
+    if (!jreq)
+        return json_response(conn, MHD_HTTP_BAD_REQUEST, "{\"error\":\"invalid JSON\"}");
+
+    json_object *jold = NULL, *jnew = NULL;
+    if (!json_object_object_get_ex(jreq, "oldPassword", &jold) ||
+        !json_object_object_get_ex(jreq, "newPassword", &jnew)) {
+        json_object_put(jreq);
+        return json_response(conn, MHD_HTTP_BAD_REQUEST, "{\"error\":\"missing oldPassword or newPassword\"}");
+    }
+
+    const char *old_pw = json_object_get_string(jold);
+    const char *new_pw = json_object_get_string(jnew);
+    int rc = cm_change_password(ctx->cm, old_pw, new_pw);
+    json_object_put(jreq);
+
+    if (rc == -1) return json_response(conn, MHD_HTTP_UNAUTHORIZED, "{\"error\":\"bad_password\"}");
+    if (rc < 0)   return json_response(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, "{\"error\":\"sync failed\"}");
+    return json_response(conn, MHD_HTTP_OK, "{\"ok\":true}");
+}
+
+/* ------------------------------------------------------------------ */
+/* GET /api/config/r2-settings                                         */
+/* ------------------------------------------------------------------ */
+static enum MHD_Result
+handle_config_r2_settings_get(struct MHD_Connection *conn, app_context_t *ctx)
+{
+    r2_config_t r2 = {0};
+    cm_get_r2_config(ctx->cm, &r2);
+
+    json_object *jobj = json_object_new_object();
+    json_object_object_add(jobj, "endpoint",        json_object_new_string(r2.endpoint));
+    json_object_object_add(jobj, "accessKeyId",     json_object_new_string(r2.access_key_id));
+    json_object_object_add(jobj, "secretAccessKey", json_object_new_string(r2.secret_access_key));
+    json_object_object_add(jobj, "bucket",          json_object_new_string(r2.bucket));
+    json_object_object_add(jobj, "objectKey",       json_object_new_string(r2.object_key));
+
+    const char *json_str = json_object_to_json_string(jobj);
+    enum MHD_Result ret = json_response(conn, MHD_HTTP_OK, json_str);
+    json_object_put(jobj);
+    return ret;
+}
+
+/* ------------------------------------------------------------------ */
+/* POST /api/config/r2-settings                                        */
+/* ------------------------------------------------------------------ */
+static enum MHD_Result
+handle_config_r2_settings_post(struct MHD_Connection *conn, const char *body, app_context_t *ctx)
+{
+    if (!body || body[0] == '\0')
+        return json_response(conn, MHD_HTTP_BAD_REQUEST, "{\"error\":\"empty body\"}");
+
+    json_object *jreq = json_tokener_parse(body);
+    if (!jreq)
+        return json_response(conn, MHD_HTTP_BAD_REQUEST, "{\"error\":\"invalid JSON\"}");
+
+    r2_config_t new_cfg = {0};
+    json_object *jv;
+    if (json_object_object_get_ex(jreq, "endpoint", &jv))
+        snprintf(new_cfg.endpoint, sizeof(new_cfg.endpoint), "%s", json_object_get_string(jv));
+    if (json_object_object_get_ex(jreq, "accessKeyId", &jv))
+        snprintf(new_cfg.access_key_id, sizeof(new_cfg.access_key_id), "%s", json_object_get_string(jv));
+    if (json_object_object_get_ex(jreq, "secretAccessKey", &jv))
+        snprintf(new_cfg.secret_access_key, sizeof(new_cfg.secret_access_key), "%s", json_object_get_string(jv));
+    if (json_object_object_get_ex(jreq, "bucket", &jv))
+        snprintf(new_cfg.bucket, sizeof(new_cfg.bucket), "%s", json_object_get_string(jv));
+    if (json_object_object_get_ex(jreq, "objectKey", &jv))
+        snprintf(new_cfg.object_key, sizeof(new_cfg.object_key), "%s", json_object_get_string(jv));
+
+    int rc = cm_set_r2_config(ctx->cm, &new_cfg);
+    json_object_put(jreq);
+
+    return rc == 0 ? json_response(conn, MHD_HTTP_OK, "{\"ok\":true}")
+                   : json_response(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, "{\"error\":\"sync failed with new credentials\"}");
+}
+
+/* ------------------------------------------------------------------ */
+/* POST /api/config/r2-test                                            */
+/* ------------------------------------------------------------------ */
+static enum MHD_Result
+handle_config_r2_test(struct MHD_Connection *conn, const char *body, app_context_t *ctx)
+{
+    r2_config_t test_cfg = {0};
+    int use_body = (body && body[0] != '\0' && strcmp(body, "{}") != 0);
+
+    if (use_body) {
+        json_object *jreq = json_tokener_parse(body);
+        if (!jreq)
+            return json_response(conn, MHD_HTTP_BAD_REQUEST, "{\"error\":\"invalid JSON\"}");
+
+        json_object *jv;
+        if (json_object_object_get_ex(jreq, "endpoint", &jv))
+            snprintf(test_cfg.endpoint, sizeof(test_cfg.endpoint), "%s", json_object_get_string(jv));
+        if (json_object_object_get_ex(jreq, "accessKeyId", &jv))
+            snprintf(test_cfg.access_key_id, sizeof(test_cfg.access_key_id), "%s", json_object_get_string(jv));
+        if (json_object_object_get_ex(jreq, "secretAccessKey", &jv))
+            snprintf(test_cfg.secret_access_key, sizeof(test_cfg.secret_access_key), "%s", json_object_get_string(jv));
+        if (json_object_object_get_ex(jreq, "bucket", &jv))
+            snprintf(test_cfg.bucket, sizeof(test_cfg.bucket), "%s", json_object_get_string(jv));
+        if (json_object_object_get_ex(jreq, "objectKey", &jv))
+            snprintf(test_cfg.object_key, sizeof(test_cfg.object_key), "%s", json_object_get_string(jv));
+        json_object_put(jreq);
+    } else {
+        /* Usa credenziali salvate */
+        cm_get_r2_config(ctx->cm, &test_cfg);
+        /* Se la secret è mascherata, rileggi dal file direttamente */
+        if (test_cfg.endpoint[0] == '\0')
+            return json_response(conn, MHD_HTTP_BAD_REQUEST, "{\"error\":\"no R2 configuration\"}");
+        /* La cm_get_r2_config restituisce secret mascherata. Per il test con credenziali salvate
+         * usiamo r2_config_load direttamente per avere secret reale */
+        r2_config_t real_cfg = {0};
+        if (r2_config_load(&real_cfg) == 0) {
+            test_cfg = real_cfg;
+        }
+    }
+
+    if (test_cfg.endpoint[0] == '\0')
+        return json_response(conn, MHD_HTTP_BAD_REQUEST, "{\"error\":\"no R2 configuration\"}");
+
+    int rc = r2_test_connection(&test_cfg);
+    return rc == 0 ? json_response(conn, MHD_HTTP_OK, "{\"ok\":true}")
+                   : json_response(conn, MHD_HTTP_BAD_GATEWAY, "{\"error\":\"connection failed\"}");
+}
+
+/* ------------------------------------------------------------------ */
 /* Callback principale MHD — router                                    */
 /* ------------------------------------------------------------------ */
 
@@ -603,6 +952,22 @@ request_handler(void *cls,
             ret = handle_terminal_open(conn, body, ctx);
         else if (strcmp(url, "/api/password") == 0)
             ret = handle_password(conn, body, ctx);
+        else if (strcmp(url, "/api/config/setup") == 0)
+            ret = handle_config_setup(conn, body, ctx);
+        else if (strcmp(url, "/api/config/unlock") == 0)
+            ret = handle_config_unlock(conn, body, ctx);
+        else if (strcmp(url, "/api/host/save") == 0)
+            ret = handle_host_save(conn, body, ctx);
+        else if (strcmp(url, "/api/host/delete") == 0)
+            ret = handle_host_delete(conn, body, ctx);
+        else if (strcmp(url, "/api/config/use-local") == 0)
+            ret = handle_config_use_local(conn, ctx);
+        else if (strcmp(url, "/api/config/change-password") == 0)
+            ret = handle_config_change_password(conn, body, ctx);
+        else if (strcmp(url, "/api/config/r2-settings") == 0)
+            ret = handle_config_r2_settings_post(conn, body, ctx);
+        else if (strcmp(url, "/api/config/r2-test") == 0)
+            ret = handle_config_r2_test(conn, body, ctx);
         else
             ret = json_response(conn, MHD_HTTP_NOT_FOUND,
                                 "{\"error\":\"unknown endpoint\"}");
@@ -623,6 +988,10 @@ request_handler(void *cls,
             return handle_get_status(conn, ctx);
         if (strcmp(url, "/api/internal/askpass") == 0)
             return handle_internal_askpass(conn, ctx);
+        if (strcmp(url, "/api/config/status") == 0)
+            return handle_config_status(conn, ctx);
+        if (strcmp(url, "/api/config/r2-settings") == 0)
+            return handle_config_r2_settings_get(conn, ctx);
         /* Tutto il resto: file statici */
         return serve_static(conn, url);
     }
