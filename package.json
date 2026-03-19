@@ -16,6 +16,9 @@
     "ui:build": "cd ui && npm run build",
     "ui:dev": "cd ui && npm run dev",
 
-    "start": "./sshpad"
+    "start": "./sshpad",
+
+    "dpkg:build": "npm run build && bash scripts/build-deb.sh",
+    "dpkg:release": "npm run dpkg:build && bash scripts/release.sh"
   }
 }
